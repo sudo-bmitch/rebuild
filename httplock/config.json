@@ -1,0 +1,22 @@
+{
+  "api": {
+    "addr": ":8081"
+  },
+  "proxy": {
+    "addr": ":8080",
+    "filters": [
+      {
+        "reqHeader": {
+          "Traceparent": "strip",
+          "User-Agent": "ignore"
+        }
+      }
+    ]
+  },
+  "storage": {
+    "backing": "filesystem",
+    "filesystem": {
+      "directory": "/var/lib/httplock/data"
+    }
+  }
+}

@@ -1,94 +1,175 @@
 #!/bin/sh
 
 set -e
-base_name="alpine:latest"
-tag_prefix="alpine"
-git_short="$(git rev-parse --short HEAD)"
-# use SOURCE_DATE_EPOCH if defined, otherwise use git commit date
-# SOURCE_DATE_EPOCH is in sec, unix epoc style, e.g. 1577854800 for 2020-01-01
-date_git="$(date -d "@$(git log -1 --format=%at)" +%Y-%m-%dT%H:%M:%SZ --utc)"
-date_cur="$(date -u +%Y%m%d-%H%M%S)"
 
 # - modes:
 #   - build
 #   - reproduce
-#   - httplock refresh and compare
+#   - TODO: httplock refresh and compare
 
-# TODO: add unique id for labels and container names (include git short hash and random)
+# parse input
+opt_b=""
+opt_c="."
+opt_f="Dockerfile"
+opt_l="ocidir://repo"
+opt_L="rebuild"
+opt_n=0
+opt_t="ocidir://repo:unknown"
 
-# - setup private (no gw) and public networks
-docker network create --internal --label rebuild.test rebuild-build
-docker network create --label rebuild.test rebuild-gw
-docker volume create --label rebuild.test httplock-data
+while getopts 'b:c:ef:hl:L:nt:' option; do
+  case $option in
+    b) opt_b="$OPTARG";;
+    c) opt_c="$OPTARG";;
+    e) opt_e=1;;
+    f) opt_f="$OPTARG";;
+    h) opt_h=1;;
+    l) opt_l="$OPTARG";;
+    L) opt_L="$OPTARG";;
+    n) opt_n=1;;
+    t) opt_t="$OPTARG";;
+  esac
+done
+set +e
+shift $(expr $OPTIND - 1)
 
-  
-# - setup http lock in both networks and publish random port, extract CA
-# TODO: remove published port, run commands in containers if needed
-docker run -d --name httplock-proxy \
-  --label rebuild.test \
-  --network rebuild-gw \
-  -v "httplock-data:/var/lib/httplock/data" \
-  -v "$(pwd)/.rebuilder/config.json:/config.json" \
-  -p "127.0.0.1:8080:8080" -p "127.0.0.1:8081:8081" \
-  httplock/httplock server -c /config.json
-docker network connect --alias proxy rebuild-build httplock-proxy
-proxy_ip="$(docker container inspect httplock-proxy --format '{{ (index .NetworkSettings.Networks "rebuild-build").IPAddress }}')"
-curl -s http://127.0.0.1:8081/ca >.rebuilder/ca.pem
-# for build get a uuid
-if [ -n "$hash" ]; then
-  uuid=$(curl -sX POST -d "hash=$hash" http://127.0.0.1:8081/token | jq -r .uuid)
-else
-  uuid=$(curl -sX POST http://127.0.0.1:8081/token | jq -r .uuid)
+if [ $# -gt 0 -o "$opt_h" = "1" ]; then
+  echo "Usage: $0 [opts] file"
+  echo " -b ref: base image"
+  echo " -c dir: context"
+  echo " -e: allow external network, do not reproduce hermetically"
+  echo " -f file: Dockerfile name"
+  echo " -h: this help message"
+  echo " -n: build a new image instead of reproducing an existing one"
+  echo " -l ref: local repo for rebuilding"
+  echo " -L prefix: prefix for tags in local repo"
+  echo " -t ref: image to create/verify"
+  exit 1
 fi
-echo "${uuid}"
-# uuid="uuid:389f2026-fe77-4ad7-973d-ba47cb509ffe"
 
-regctl() {
-  docker container run -i --rm --net rebuild-build \
-    --label rebuild.test \
+# specify target image
+tag_prefix="alpine"
+date_cur="$(date -u +%Y%m%d-%H%M%S)"
+# use SOURCE_DATE_EPOCH if defined, otherwise use git commit date
+if [ -n "${SOURCE_DATE_EPOCH}" ]; then
+  epoc="${SOURCE_DATE_EPOC}"
+else
+  epoc="$(git log -1 --format=%at)"
+fi
+date_max="$(date -d "@${epoc}" +%Y-%m-%dT%H:%M:%SZ --utc)"
+git_short="$(git rev-parse --short HEAD)"
+rnd="$(base32 </dev/random | head -c10)"
+label="rebuild-${git_short}-${rnd}"
+label_global="rebuild"
+
+# setup private (no gw) and public networks
+docker network create --internal --label "${label}" --label "${label_global}" "rebuild-build-${git_short}-${rnd}"
+docker network create --label "${label}" --label "${label_global}" "rebuild-gw-${git_short}-${rnd}"
+docker volume create --label "${label}" --label "${label_global}" "httplock-data-${git_short}-${rnd}"
+docker volume inspect "httplock-data" >/dev/null 2>&1 || docker volume create --label "${label_global}-save" "httplock-data"
+
+regctl_proxy() {
+  docker container run -i --rm --net "rebuild-build-${git_short}-${rnd}" \
+    --label "${label}" --label "${label_global}" \
     -u "$(id -u):$(id -g)" -w "$(pwd)" -v "$(pwd):$(pwd)" \
-    -e http_proxy=http://token:${uuid}@proxy:8080 \
-    -e https_proxy=http://token:${uuid}@proxy:8080 \
-    -v "$(pwd)/.rebuilder/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
+    -e http_proxy=http://token:${token}@proxy:8080 \
+    -e https_proxy=http://token:${token}@proxy:8080 \
+    -v "$(pwd)/.rebuild/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
     regclient/regctl "$@"
 }
+regctl_public() {
+  docker container run -i --rm \
+    --label "${label}" --label "${label_global}" \
+    -u "$(id -u):$(id -g)" -w "$(pwd)" -v "$(pwd):$(pwd)" \
+    regclient/regctl "$@"
+}
+curl_proxy() {
+  docker container run -i --rm --net "rebuild-build-${git_short}-${rnd}" \
+    -u "$(id -u):$(id -g)" -w "$(pwd)" -v "$(pwd):$(pwd)" \
+    --label "${label}" --label "${label_global}" \
+    curlimages/curl "$@"
+}
 
-# TODO: for rebuild, define the login/root hash
+# setup http lock in both networks, extract CA
+docker run -d --name "httplock-proxy-${git_short}-${rnd}" \
+  --label "${label}" --label "${label_global}" \
+  --network "rebuild-gw-${git_short}-${rnd}" \
+  -v "httplock-data-${git_short}-${rnd}:/var/lib/httplock/data" \
+  -v "$(pwd)/httplock/config.json:/config.json:ro" \
+  httplock/httplock server -c /config.json
+docker network connect --alias proxy "rebuild-build-${git_short}-${rnd}" "httplock-proxy-${git_short}-${rnd}"
+proxy_ip="$(docker container inspect "httplock-proxy-${git_short}-${rnd}" --format "{{ (index .NetworkSettings.Networks \"rebuild-build-${git_short}-${rnd}\").IPAddress }}")"
+if [ -z "$proxy_ip" ]; then
+  echo "Failed to lookup proxy ip"
+  exit 1
+fi
+curl_proxy -s http://proxy:8081/ca >.rebuild/ca.pem
 
-# TODO: get timestamp from source, fixed, from base, 1970-01-01
 
-# - pull digest for base image, use regctl on private network with http lock
-base_digest=""
-if [ -n "$base_name" ]; then
-  base_digest=$(regctl image digest "$base_name")
+# for build get a uuid, use hash from existing image when rebuilding
+hash=""
+if [ "$opt_n" = "0" ]; then
+  hash=$(regctl_proxy manifest get "${opt_t}" --format '{{ index .Annotations "reproducible.httplock.hash" }}')
+  token="${hash}"
 fi
 
-# - setup build environment in private net with proxy vars
-# - run build, include args for source, CA, build conf
-# - output to oci tar
+# load previous data from hash into proxy
+if [ "$opt_n" = "0" ]; then
+  hash_digest=$(regctl_public artifact list "${opt_t}" \
+    --format '{{range .Descriptors}}{{ if eq ( index .Annotations "reproducible.httplock.hash" ) "'${hash}'" }}{{println .Digest}}{{end}}{{end}}' | head -1)
+  regctl_public artifact get "${opt_t}@${hash_digest}" >out/httplock.tgz
+  curl_proxy -T out/httplock.tgz "http://proxy:8081/storage/${hash}/import"
+fi
+
+# generate a uuid if needed
+if [ "$opt_n" = "0" ]; then
+  if [ "$opt_e" = "1" ]; then
+    token=$(curl_proxy -sX POST -d "hash=$hash" http://proxy:8081/token | jq -r .uuid)
+  fi
+else
+  token=$(curl_proxy -sX POST http://proxy:8081/token | jq -r .uuid)
+fi
+echo "token = ${token}"
+
+# get base image/digest
+base_digest=""
+if [ "${opt_n}" = "0" ] && [ -z "${opt_b}" ]; then
+  opt_b="$(regctl_proxy manifest get "${opt_t}" --format '{{ index .Annotations "org.opencontainers.image.base.name" }}')"
+  base_digest="$(regctl_proxy manifest get "${opt_t}" --format '{{ index .Annotations "org.opencontainers.image.base.digest" }}')"
+fi
+# use digest from existing image when rebuilding
+if [ -n "${opt_b}" ] && [ -z "${base_digest}" ]; then
+  base_digest="$(regctl_proxy image digest "${opt_b}")"
+fi
+
+# setup build environment in private net with proxy vars
+# run build, include args for source, CA, build conf
+# output to oci tar
+  # --opt "build-arg:REBUILD_CA=$(cat .rebuild/ca.pem)" \
 docker run \
   --rm \
-  --label rebuild.test \
-  --net rebuild-build \
+  --label "${label}" --label "${label_global}" \
+  --net "rebuild-build-${git_short}-${rnd}" \
   --privileged \
-  -e http_proxy=http://token:${uuid}@proxy:8080 \
-  -e https_proxy=http://token:${uuid}@proxy:8080 \
-  -v "$(pwd)/.rebuilder/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
+  -e http_proxy=http://token:${token}@proxy:8080 \
+  -e https_proxy=http://token:${token}@proxy:8080 \
+  -e BUILDCTL_CONNECT_RETRIES_MAX=100 \
+  -v "$(pwd)/.rebuild/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
   -v "$(pwd):/tmp/work:ro" \
   -v "$(pwd)/out:/tmp/out" \
+  -w "/tmp/work" \
   --entrypoint buildctl-daemonless.sh \
   moby/buildkit:master \
     build \
     --frontend dockerfile.v0 \
-    --local context=/tmp/work/example/alpine \
-    --local dockerfile=/tmp/work/example/alpine \
-    --local rebuild=/tmp/work/.rebuilder \
-    --opt context:rebuild=local:rebuild \
+    --local context=${opt_c} \
+    --local dockerfile=${opt_c} \
+    --local rebuilder=/tmp/work/.rebuild \
+    --opt context:rebuilder/rebuilder=local:rebuilder \
+    --opt "build-arg:http_proxy=http://token:${token}@${proxy_ip}:8080" \
+    --opt "build-arg:https_proxy=http://token:${token}@${proxy_ip}:8080" \
+    --opt "build-arg:SOURCE_DATE_EPOC=${epoc}" \
     --opt platform=linux/amd64,linux/arm64 \
-    --opt build-arg:http_proxy=http://token:${uuid}@${proxy_ip}:8080 \
-    --opt build-arg:https_proxy=http://token:${uuid}@${proxy_ip}:8080 \
-    --opt "build-arg:REBUILD_CA=$(cat .rebuilder/ca.pem)" \
-    --opt filename=./Dockerfile \
+    --opt "filename=${opt_f}" \
     --opt source=docker/dockerfile:1 \
     --output type=oci,dest=/tmp/out/output.tar \
     --metadata-file /tmp/out/metadata.json
@@ -96,15 +177,15 @@ docker run \
 # # rootless, untested
 # docker run \
 #     --rm \
-#     --label rebuild.test \
-#     --net rebuild-build \
+#     --label "${label}" --label "${label_global}" \
+#     --net "rebuild-build-${git_short}-${rnd}" \
 #     --security-opt seccomp=unconfined \
 #     --security-opt apparmor=unconfined \
 #     --device /dev/fuse \
 #     -e "BUILDKITD_FLAGS=--oci-worker-no-process-sandbox" \
-#     -e http_proxy=http://token:${uuid}@proxy:8080 \
-#     -e https_proxy=http://token:${uuid}@proxy:8080 \
-#     -v "$(pwd)/.rebuilder/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
+#     -e http_proxy=http://token:${token}@proxy:8080 \
+#     -e https_proxy=http://token:${token}@proxy:8080 \
+#     -v "$(pwd)/.rebuild/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
 #     -v "$(pwd):/tmp/work:ro" \
 #     -v "$(pwd)/out:/tmp/out" \
 #     --entrypoint buildctl-daemonless.sh \
@@ -114,54 +195,80 @@ docker run \
 #         --local context=/tmp/work \
 #         --local dockerfile=/tmp/work/example/alpine \
 #         --opt platform=linux/amd64,linux/arm64 \
-#         --opt build-arg:http_proxy=http://token:${uuid}@proxy:8080 \
-#         --opt build-arg:https_proxy=http://token:${uuid}@proxy:8080 \
-#         --opt "build-arg:REBUILD_CA=$(cat .rebuilder/ca.pem)" \
+#         --opt build-arg:http_proxy=http://token:${token}@proxy:8080 \
+#         --opt build-arg:https_proxy=http://token:${token}@proxy:8080 \
+#         --opt "build-arg:REBUILD_CA=$(cat .rebuild/ca.pem)" \
 #         --opt filename=./Dockerfile \
 #         --opt source=docker/dockerfile:1 \
 #         --output type=oci,dest=/tmp/out/output.tar \
 #         --metadata-file /tmp/out/metadata.json
 
-# - extract tar to ocidir
-# mkdir -p out/outoci
-# tar -xf out/output.tar -C out/outoci/
-# date_cur=20220420-005725
-# date_cur=20220530-000500
-tag_cur="${tag_prefix}-${git_short}-${date_cur}"
-regctl image import "ocidir://.rebuilder/repo:${tag_cur}-orig" out/output.tar
+# extract tar to ocidir
+tag_cur="${opt_L}-${git_short}-${date_cur}"
+regctl_public image import "${opt_l}:${tag_cur}-orig" out/output.tar
 
-# - generate http lock digest if new image
-hash=$(curl -sX POST "http://127.0.0.1:8081/token/${uuid}/save" | jq -r .hash)
-echo "${hash}"
-# hash="sha256:40a7c8acd175e56510f02da70f352ac41b02c513828efee3135f4d8a730e52d4"
-# hash="sha256:4b1a2953a8dfe57504efa62f7a8e3bc2254dff84d8108986c11c2c9da8ef1630"
+# generate http lock digest if new image
+if [ "$opt_n" = "1" ] || [ "$opt_e" = "1" ]; then
+  hash=$(curl_proxy -sX POST "http://proxy:8081/token/${token}/save" | jq -r .hash)
+  echo "${hash}"
+fi
 
-# - apply mods (strip files), strip CA layer, reset timestamps
+# apply mods (strip files), strip CA layer, reset timestamps, add annotations
 #  --layer-strip-file /lib/apk/db/scripts.tar \
-#  --buildarg-rm "REBUILD_CA=$(cat .rebuilder/ca.pem)" \
-regctl image mod "ocidir://.rebuilder/repo:${tag_cur}-orig" --create "${tag_cur}-v2" \
-  --layer-rm-created-by '.*\/etc\/ssl\/certs\/ca-certificates\.crt.*' \
-  --file-tar-time-max "/lib/apk/db/scripts.tar,${date_git}" \
-  --time-max "${date_git}" \
-  --buildarg-rm-regex "REBUILD_CA=-----BEGIN CERTIFICATE.*END CERTIFICATE-----" \
+#  --buildarg-rm "REBUILD_CA=$(cat .rebuild/ca.pem)" \
+#  --buildarg-rm-regex "REBUILD_CA=-----BEGIN CERTIFICATE.*END CERTIFICATE-----" \
+#  --layer-rm-created-by '.*\/etc\/ssl\/certs\/ca-certificates\.crt.*' \
+# TODO: add more user provided options, or load from a config file
+regctl_public image mod "${opt_l}:${tag_cur}-orig" --create "${tag_cur}" \
+  --layer-rm-created-by 'COPY ./ca.pem /etc/ssl/certs/ca-certificates.crt' \
+  --buildarg-rm "SOURCE_DATE_EPOC=${epoc}" \
+  --file-tar-time-max "/lib/apk/db/scripts.tar,${date_max}" \
+  --time-max "${date_max}" \
   --annotation "reproducible.httplock.hash=${hash}" \
-  --annotation "org.opencontainers.image.created=${date_git}" \
-  --annotation "org.opencontainers.image.base.name=${base_name}" \
+  --annotation "org.opencontainers.image.created=${date_max}" \
+  --annotation "org.opencontainers.image.base.name=${opt_b}" \
   --annotation "org.opencontainers.image.base.digest=${base_digest}"
 
-# - add annotations for base, httplock, build conf
-# - if reproducing, compare resulting image
-#   - if digest mismatch, perform a deep compare of layers and json
-#   - import json to objects and compare
-#   - if json whitespace diff, push updated config/manifest to ocidir
-#   - if mismatch, log diff of failure, abend
+# export and push httplock data
+if [ "$opt_n" = "1" ] || [ "$opt_e" = "1" ]; then
+  curl_proxy "http://proxy:8081/storage/${hash}/export" >out/httplock.tgz
+  regctl_public artifact put \
+    --config-media-type application/vnd.httplock.export \
+    --media-type application/vnd.httplock.export.tar.gzip \
+    -f out/httplock.tgz \
+    --annotation "reproducible.httplock.hash=${hash}" \
+    --refers "${opt_l}:${tag_cur}"
+fi
+
+# if reproducing, compare resulting image
+#  if digest mismatch, report
+#  if mismatch, log diff of failure, abend
+if [ "$opt_n" = "0" ]; then
+  orig_dig="$(regctl_proxy image digest "${opt_t}")"
+  new_dig="$(regctl_proxy image digest "${opt_l}:${tag_cur}")"
+  if [ "$orig_dig" != "$new_dig" ]; then
+    echo "DIGEST MISMATCH"
+    echo "Original: $orig_dig"
+    echo "New: $new_dig"    
+    # TODO: show diff
+    exit 1
+  else
+    echo "Success: digests match: ${orig_dig}"
+  fi
+fi
+
+# if new image, push image and any associated artifacts
+if [ "$opt_n" = "1" ]; then
+  regctl_public image copy --digest-tags --referrers "${opt_l}:${tag_cur}" "${opt_t}"
+fi
+
 # - run post build actions (sbom, sign)
-# - push image and any associated artifacts
 # - run post push actions
 
 # cleanup
-docker container stop $(docker container ls --filter label=rebuild.test -q)
-docker container prune -f --filter label=rebuild.test
-docker network   prune -f --filter label=rebuild.test
-docker volume    prune -f --filter label=rebuild.test
-# TODO: prune `out` dir
+docker container stop $(docker container ls --filter label="${label}" -q)
+docker container prune -f --filter label="${label}"
+docker network   prune -f --filter label="${label}"
+docker volume    prune -f --filter label="${label}"
+
+# TODO: purge out directory
