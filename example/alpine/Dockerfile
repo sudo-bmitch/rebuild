@@ -8,4 +8,5 @@ RUN apk add \
       ca-certificates \
       curl \
       git \
-      make
+      make \
+ && rm -rf /var/log/* /var/cache/*

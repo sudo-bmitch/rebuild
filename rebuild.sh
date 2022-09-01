@@ -62,8 +62,10 @@ label="rebuild-${git_short}-${rnd}"
 label_global="rebuild"
 
 # setup private (no gw) and public networks
+if [ "$opt_e" = "1" ] || [ "$opt_n" = "1" ]; then
+  docker network create --label "${label}" --label "${label_global}" "rebuild-gw-${git_short}-${rnd}"
+fi
 docker network create --internal --label "${label}" --label "${label_global}" "rebuild-build-${git_short}-${rnd}"
-docker network create --label "${label}" --label "${label_global}" "rebuild-gw-${git_short}-${rnd}"
 docker volume create --label "${label}" --label "${label_global}" "httplock-data-${git_short}-${rnd}"
 docker volume inspect "httplock-data" >/dev/null 2>&1 || docker volume create --label "${label_global}-save" "httplock-data"
 
@@ -74,7 +76,7 @@ regctl_proxy() {
     -e http_proxy=http://token:${token}@proxy:8080 \
     -e https_proxy=http://token:${token}@proxy:8080 \
     -v "$(pwd)/.rebuild/ca.pem:/etc/ssl/certs/ca-certificates.crt:ro" \
-    regclient/regctl "$@"
+    regclient/regctl --user-agent regclient/regclient "$@"
 }
 regctl_public() {
   docker container run -i --rm \
@@ -89,21 +91,24 @@ curl_proxy() {
     curlimages/curl "$@"
 }
 
-# setup http lock in both networks, extract CA
+# setup http lock
 docker run -d --name "httplock-proxy-${git_short}-${rnd}" \
   --label "${label}" --label "${label_global}" \
-  --network "rebuild-gw-${git_short}-${rnd}" \
+  --network "rebuild-build-${git_short}-${rnd}" --network-alias proxy \
   -v "httplock-data-${git_short}-${rnd}:/var/lib/httplock/data" \
   -v "$(pwd)/httplock/config.json:/config.json:ro" \
   httplock/httplock server -c /config.json
-docker network connect --alias proxy "rebuild-build-${git_short}-${rnd}" "httplock-proxy-${git_short}-${rnd}"
+# attach to external network only if permitted
+if [ "$opt_e" = "1" ] || [ "$opt_n" = "1" ]; then
+  docker network connect "rebuild-gw-${git_short}-${rnd}" "httplock-proxy-${git_short}-${rnd}"
+fi
+# track proxy ip and extract CA
 proxy_ip="$(docker container inspect "httplock-proxy-${git_short}-${rnd}" --format "{{ (index .NetworkSettings.Networks \"rebuild-build-${git_short}-${rnd}\").IPAddress }}")"
 if [ -z "$proxy_ip" ]; then
   echo "Failed to lookup proxy ip"
   exit 1
 fi
 curl_proxy -s http://proxy:8081/ca >.rebuild/ca.pem
-
 
 # for build get a uuid, use hash from existing image when rebuilding
 hash=""
@@ -114,9 +119,13 @@ fi
 
 # load previous data from hash into proxy
 if [ "$opt_n" = "0" ]; then
-  hash_digest=$(regctl_public artifact list "${opt_t}" \
-    --format '{{range .Descriptors}}{{ if eq ( index .Annotations "reproducible.httplock.hash" ) "'${hash}'" }}{{println .Digest}}{{end}}{{end}}' | head -1)
-  regctl_public artifact get "${opt_t}@${hash_digest}" >out/httplock.tgz
+  hash_digest="$(regctl_public artifact list "${opt_t}" \
+    --filter-artifact-type application/vnd.httplock.export \
+    --filter-annotation "reproducible.httplock.hash=${hash}" \
+    --format '{{ (index .Descriptors 0).Digest }}')"
+  # hash_digest=$(regctl_public artifact list "${opt_t}" \
+  #   --format '{{range .Descriptors}}{{ if eq ( index .Annotations "reproducible.httplock.hash" ) "'${hash}'" }}{{println .Digest}}{{end}}{{end}}' | head -1)
+  regctl_public artifact get -m application/vnd.httplock.export.tar.gzip "${opt_t}@${hash_digest}" >out/httplock.tgz
   curl_proxy -T out/httplock.tgz "http://proxy:8081/storage/${hash}/import"
 fi
 
@@ -145,8 +154,13 @@ fi
 # run build, include args for source, CA, build conf
 # output to oci tar
   # --opt "build-arg:REBUILD_CA=$(cat .rebuild/ca.pem)" \
+if [ -t 0 ]; then
+  arg_in="-it"
+else
+  arg_in="-i"
+fi
 docker run \
-  --rm \
+  --rm "$arg_in" \
   --label "${label}" --label "${label_global}" \
   --net "rebuild-build-${git_short}-${rnd}" \
   --privileged \
@@ -233,8 +247,8 @@ regctl_public image mod "${opt_l}:${tag_cur}-orig" --create "${tag_cur}" \
 if [ "$opt_n" = "1" ] || [ "$opt_e" = "1" ]; then
   curl_proxy "http://proxy:8081/storage/${hash}/export" >out/httplock.tgz
   regctl_public artifact put \
-    --config-media-type application/vnd.httplock.export \
-    --media-type application/vnd.httplock.export.tar.gzip \
+    --artifact-type application/vnd.httplock.export \
+    -m application/vnd.httplock.export.tar.gzip \
     -f out/httplock.tgz \
     --annotation "reproducible.httplock.hash=${hash}" \
     --refers "${opt_l}:${tag_cur}"
@@ -249,7 +263,8 @@ if [ "$opt_n" = "0" ]; then
   if [ "$orig_dig" != "$new_dig" ]; then
     echo "DIGEST MISMATCH"
     echo "Original: $orig_dig"
-    echo "New: $new_dig"    
+    echo "New: $new_dig"
+    docker logs "httplock-proxy-${git_short}-${rnd}" 2>&1 | grep "Cache miss"
     # TODO: show diff
     exit 1
   else

@@ -14,9 +14,7 @@
     ]
   },
   "storage": {
-    "backing": "filesystem",
-    "filesystem": {
-      "directory": "/var/lib/httplock/data"
-    }
+    "kind": "filesystem",
+    "directory": "/var/lib/httplock/data"
   }
 }
