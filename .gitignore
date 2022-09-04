@@ -1,3 +1,4 @@
 .rebuild
 out/
 repo/
+test/

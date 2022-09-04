@@ -61,6 +61,10 @@ rnd="$(base32 </dev/random | head -c10)"
 label="rebuild-${git_short}-${rnd}"
 label_global="rebuild"
 
+if [ ! -d .rebuild ]; then
+  mkdir -p .rebuild
+fi
+
 # setup private (no gw) and public networks
 if [ "$opt_e" = "1" ] || [ "$opt_n" = "1" ]; then
   docker network create --label "${label}" --label "${label_global}" "rebuild-gw-${git_short}-${rnd}"
@@ -108,7 +112,7 @@ if [ -z "$proxy_ip" ]; then
   echo "Failed to lookup proxy ip"
   exit 1
 fi
-curl_proxy -s http://proxy:8081/ca >.rebuild/ca.pem
+curl_proxy -s http://proxy:8081/api/ca >.rebuild/ca.pem
 
 # for build get a uuid, use hash from existing image when rebuilding
 hash=""
@@ -126,16 +130,16 @@ if [ "$opt_n" = "0" ]; then
   # hash_digest=$(regctl_public artifact list "${opt_t}" \
   #   --format '{{range .Descriptors}}{{ if eq ( index .Annotations "reproducible.httplock.hash" ) "'${hash}'" }}{{println .Digest}}{{end}}{{end}}' | head -1)
   regctl_public artifact get -m application/vnd.httplock.export.tar.gzip "${opt_t}@${hash_digest}" >out/httplock.tgz
-  curl_proxy -T out/httplock.tgz "http://proxy:8081/storage/${hash}/import"
+  curl_proxy -T out/httplock.tgz "http://proxy:8081/api/root/${hash}/import"
 fi
 
 # generate a uuid if needed
 if [ "$opt_n" = "0" ]; then
   if [ "$opt_e" = "1" ]; then
-    token=$(curl_proxy -sX POST -d "hash=$hash" http://proxy:8081/token | jq -r .uuid)
+    token=$(curl_proxy -sX POST -d "hash=$hash" http://proxy:8081/api/token | jq -r .uuid)
   fi
 else
-  token=$(curl_proxy -sX POST http://proxy:8081/token | jq -r .uuid)
+  token=$(curl_proxy -sX POST http://proxy:8081/api/token | jq -r .uuid)
 fi
 echo "token = ${token}"
 
@@ -223,7 +227,7 @@ regctl_public image import "${opt_l}:${tag_cur}-orig" out/output.tar
 
 # generate http lock digest if new image
 if [ "$opt_n" = "1" ] || [ "$opt_e" = "1" ]; then
-  hash=$(curl_proxy -sX POST "http://proxy:8081/token/${token}/save" | jq -r .hash)
+  hash=$(curl_proxy -sX POST "http://proxy:8081/api/token/${token}/save" | jq -r .hash)
   echo "${hash}"
 fi
 
@@ -245,7 +249,7 @@ regctl_public image mod "${opt_l}:${tag_cur}-orig" --create "${tag_cur}" \
 
 # export and push httplock data
 if [ "$opt_n" = "1" ] || [ "$opt_e" = "1" ]; then
-  curl_proxy "http://proxy:8081/storage/${hash}/export" >out/httplock.tgz
+  curl_proxy "http://proxy:8081/api/root/${hash}/export" >out/httplock.tgz
   regctl_public artifact put \
     --artifact-type application/vnd.httplock.export \
     -m application/vnd.httplock.export.tar.gzip \
